@@ -1,0 +1,619 @@
+
+/*Use of AI / Cognitive Assistance Software is not allowed in any evaluation, assessment or exercise.*/
+/*=============================================================================
+File Name: ELNC6012Team2Solar.c  
+Author: Team Solar
+Date:	07/04/2025
+Modified: None
+© Fanshawe College, 2025
+
+Description: This program implements a web-controlled solar panel tracking system on an ESP32
+with LDR-based light detection, motor control, and LED indicators. The device can operate
+in AUTO or MANUAL mode via a web interface, showing real-time solar data and allowing
+manual override for LEDs and motor. Uses ESP-IDF APIs for Wi-Fi, GPIO, ADC, PWM and
+HTTP server functionality.
+	
+=============================================================================*/
+
+// Configuration Bits and Libraries ==========================================
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "driver/ledc.h"
+
+// Wi-Fi credentials for SoftAP mode
+#define WIFI_SSID "ESP32-Network"
+#define WIFI_PASS "Esp32-Password"
+
+// ADC channel definitions for LDRs and solar panel voltage sampling
+#define LDR1_PIN ADC1_CHANNEL_0  // GPIO36
+#define LDR2_PIN ADC1_CHANNEL_3  // GPIO39
+#define SOLAR_PIN ADC1_CHANNEL_6 // GPIO34
+
+// PWM definitions for servo motor control
+#define PWM_PIN GPIO_NUM_21
+#define PWM_CHANNEL LEDC_CHANNEL_0
+#define PWM_TIMER LEDC_TIMER_0
+
+// GPIOs for relay/LED control
+#define LED1_PIN GPIO_NUM_4
+#define LED2_PIN GPIO_NUM_19
+
+// Angle constants for tracking
+#define MAXANGLE 176.5
+#define MINANGLE 3.5
+#define STEP 3.5
+#define INIT 7
+
+// Global Variables ===========================================================
+
+static char webpage_data[8192];        // Buffer for dynamically generated HTML
+const char *led1_state = "OFF";        // State of heater LED
+const char *led2_state = "OFF";        // State of wiper LED
+int mode_flag = 0;                     // 0 = Manual mode, 1 = Auto mode
+int manual_motor_direction = 0;       // Manual control: 0 = stop, 1 = CW, 2 = CCW
+float anglePanel = INIT;              // Current angle of solar panel
+
+/*>>> configure_pwm: ========================================================
+Author:		Team Solar
+Date:		10/02/2025
+Desc:		Initializes PWM for motor control using LEDC on ESP32.
+Input:		None
+Returns:	None
+===========================================================================*/
+
+void configure_pwm()
+ {
+    // Configure PWM timer at 50Hz with 8-bit resolution
+    ledc_timer_config_t timer_conf =
+     {
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = PWM_TIMER,
+        .freq_hz = 50
+    };
+    ledc_timer_config(&timer_conf);
+
+    // Configure PWM channel and attach to PWM pin
+    ledc_channel_config_t channel_conf = 
+    {
+        .gpio_num = PWM_PIN,
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .channel = PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = PWM_TIMER,
+        .duty = 0
+    };
+    ledc_channel_config(&channel_conf);
+}
+
+/*>>> pwm_control_task: =====================================================
+Author:     Team Solar
+Date:       10/02/2025
+Desc:       Main control task for solar panel tracking. Continuously reads LDR
+            and solar sensor values to determine optimal panel orientation.
+            Controls servo motor via PWM, switches LEDs based on conditions,
+            and updates the web interface HTML content dynamically.
+Input:      void *pvParameters - Unused FreeRTOS task parameter.
+Returns:    None (runs as a FreeRTOS task)
+===========================================================================*/
+
+
+void pwm_control_task(void *pvParameters) 
+{
+    // Configure ADC resolution to 12 bits
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    
+    // Configure attenuation for LDR1 (GPIO36), LDR2 (GPIO39), and Solar sensor (GPIO34)
+    adc1_config_channel_atten(LDR1_PIN, ADC_ATTEN_DB_11);
+    adc1_config_channel_atten(LDR2_PIN, ADC_ATTEN_DB_11);
+    adc1_config_channel_atten(SOLAR_PIN, ADC_ATTEN_DB_11);
+
+    while (1) 
+    {
+        // Read raw ADC values from LDR1, LDR2 and Solar Panel
+        int ldr1 = adc1_get_raw(LDR1_PIN);
+        int ldr2 = adc1_get_raw(LDR2_PIN);
+        float solarValue = adc1_get_raw(SOLAR_PIN);
+
+        // Convert raw solar panel ADC value to a power percentage (custom formula)
+        solarValue = (solarValue * 0.0008056640625) * 33.3333333;
+
+        // Calculate difference between LDR values to determine light imbalance
+        int diff = abs(ldr1 - ldr2);
+
+        // Flags for motor direction and solar exposure
+        int flag = 0;               // 0 = OPTIMAL, 1 = CCW, 2 = CW
+        int flagSolar = 1;          // 1 = standard exposure, 0 = snow/dust condition
+        float duty = 0;
+
+        // Strings for displaying current status
+        char flagStatus[3][20] = {"OPTIMAL", "ANTI-CLOCKWISE", "CLOCKWISE"};
+        char solarStatus[2][20] = {"SNOW/DUST", "STANDARD EXPOSURE"};
+        char modeStatus[2][8] = {"MANUAL", "AUTO"};
+        if (mode_flag) {  // AUTO Mode
+            // If solar power is too low (e.g., due to dust/snow), activate both LEDs
+            if (solarValue <= 25) 
+            {
+                flagSolar = 0; // Set environmental flag to SNOW/DUST
+                gpio_set_level(LED2_PIN, 1); // Turn on LED2 (wiper)
+                gpio_set_level(LED1_PIN, 1); // Turn on LED1 (heater)
+                led1_state = "ON";
+                led2_state = "ON";
+            } 
+            else 
+            { 
+                // Sufficient sunlight: turn off both LEDs
+                flagSolar = 1; // Set environmental flag to STANDARD
+                gpio_set_level(LED1_PIN, 0);
+                gpio_set_level(LED2_PIN, 0);
+                led1_state = "OFF";
+                led2_state = "OFF";
+            }
+        }
+
+        // Additional check: if in MANUAL mode and solar value is low, update environmental flag
+        if (solarValue <= 25 && mode_flag==0)
+        {
+            flagSolar = 0; // Low sunlight in manual mode
+        }
+
+        if(mode_flag)
+        { // Still in AUTO mode
+            // If LDR1 sees much more light than LDR2, rotate clockwise
+            if (diff > 100 && ldr1 > ldr2) 
+            {
+                flag = 2; // CLOCKWISE
+                for (float d = 18.8; d <= 20; d += 0.1) 
+                { // PWM duty range for clockwise motion
+                    ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, d);
+                    ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+                    vTaskDelay(pdMS_TO_TICKS(20)); // Delay between each duty increment
+                }
+                anglePanel+=STEP; // Update angle
+            }
+            // If LDR2 sees more light, rotate anti-clockwise
+            else if (diff > 100 && ldr2 > ldr1) 
+            {
+                flag = 1; // ANTICLOCKWISE
+                for (float d = 33.9; d <= 35; d += 0.1) 
+                { // PWM duty range for anti-clockwise
+                    ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, d);
+                    ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+                anglePanel-=STEP; // Update angle
+            } 
+            else 
+            {
+                // No major light difference → stop motor
+                duty = 0;
+                flag = 0; // OPTIMAL
+                ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, duty);
+                ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+            }
+        }
+
+        else
+        {
+            // MANUAL mode motor control
+            switch (manual_motor_direction) 
+            {
+                case 1:  // Clockwise
+                    for (float d = 18.8; d <= 20; d += 0.1) 
+                    {
+                        ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, d);
+                        ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+		            anglePanel+=STEP; // Increase angle
+                    flag = 2; // CLOCKWISE
+                    break;
+                case 2:  // Anticlockwise
+                    for (float d = 33.9; d <= 35; d += 0.1) 
+                    {
+                        ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, d);
+                        ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+		            anglePanel-=STEP; // Decrease angle
+                    flag = 1; // ANTICLOCKWISE
+                    break;
+                default: // Stop
+                    ledc_set_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL, 0);
+                    ledc_update_duty(LEDC_HIGH_SPEED_MODE, PWM_CHANNEL);
+                    flag = 0; // OPTIMAL/STOPPED
+                    break;
+            }
+        }
+
+        // Serial terminal debug print
+        printf("\n======== Solar Tracking System ========\n");
+        printf("Solar Panel Power Percentage: %0.2f%%\n", solarValue);
+        printf("Servo Motor Direction: %s\n", flagStatus[flag]);
+        printf("Environmental Condition: %s\n", solarStatus[flagSolar]);
+        printf("%s\n", modeStatus[mode_flag]); // Prints MANUAL or AUTO
+	    printf("Angle: %f", anglePanel); // Current angle of the panel
+        printf("=======================================\n");
+
+        // Begin writing the HTML page header and styles into the buffer
+        snprintf(webpage_data, sizeof(webpage_data),
+        "<html><head><meta http-equiv='refresh' content='1'>"  // Auto-refresh page every 1 second
+        "<style>"
+        // Base styling for page layout and fonts
+        "body { font-family: Arial; padding: 20px; background: #f0f0f0; display: flex; flex-direction: column; align-items: center; justify-content: center; }"
+        "h1, h2, p { color: #333; text-align: center; margin: 10px 0; }"
+
+        // Card-style section formatting
+        ".section { background: #fff; padding: 20px; margin: 15px 0; border-radius: 10px; width: 100%%; max-width: 600px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; display: flex; flex-direction: column; align-items: center; }"
+
+        // Mode switch styling
+        ".switch { position: relative; display: inline-block; width: 160px; height: 50px; margin: 10px auto; }"
+        ".switch input { display: none; }"
+        ".slider { position: absolute; top: 0; left: 0; right: 0; bottom: 0;"
+        "background-color:rgb(241, 142, 55); border-radius: 50px; transition: 0.4s;"
+        "display: flex; align-items: center; justify-content: flex-start;"
+        "font-size: 18px; font-weight: bold; color: white; padding-left: 26px; box-sizing: border-box; }"
+        ".slider:before { content: ''; position: absolute; height: 42px; width: 42px; left: 4px; bottom: 4px;"
+        "background-color: white; transition: 0.4s; border-radius: 50%%; z-index: 2; }"
+        "input:checked + .slider { background-color: #4CAF50; justify-content: flex-end; padding-right: 26px; }"
+        "input:checked + .slider:before { transform: translateX(100px); }"
+        "input:checked + .slider::after { content: 'AUTO'; position: absolute; left: 26px; z-index: 1; }"
+        "input:not(:checked) + .slider::after { content: 'MANUAL'; position: absolute; right: 18px; z-index: 1; }"
+
+        // LED toggle switches
+        ".switch-led { position: relative; display: inline-block; width: 100px; height: 40px; margin: 10px auto; }"
+        ".switch-led input { display: none; }"
+        ".slider-led { position: absolute; top: 0; left: 0; right: 0; bottom: 0;"
+        "background-color: rgb(243, 6, 6); border-radius: 40px; transition: 0.4s;"
+        "display: flex; align-items: center; justify-content: flex-start;"
+        "font-size: 16px; font-weight: bold; color: white; padding-left: 20px; box-sizing: border-box; }"
+        ".slider-led:before { content: ''; position: absolute; height: 32px; width: 32px; left: 4px; bottom: 4px;"
+        "background-color: white; transition: 0.4s; border-radius: 50%%; z-index: 2; }"
+        "input:checked + .slider-led { background-color:rgb(5, 253, 21); justify-content: flex-end; padding-right: 20px; }"
+        "input:checked + .slider-led:before { transform: translateX(56px); }"
+        "input:checked + .slider-led::after { content: 'ON'; position: absolute; left: 20px; z-index: 1; }"
+        "input:not(:checked) + .slider-led::after { content: 'OFF'; position: absolute; right: 14px; z-index: 1; }"
+
+        ".led-toggle-wrapper { display: flex; justify-content: center; gap: 40px; margin-top: 10px; flex-wrap: wrap; }"
+
+        // Button styles
+        "button { margin: 5px; padding: 10px 15px; border: none; border-radius: 5px; background-color: #007BFF; color: white; cursor: pointer; }"
+        "button:hover { background-color: #0056b3; }"
+        "</style>"
+        "</head><body>");
+
+        // 1. Page Header Section
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'><h1>ESP32 Solar Tracking & Monitoring System</h1></div>");
+
+        // 2. Mode Toggle Section (Switch between AUTO/MANUAL)
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'>"
+        "<h2>Operating Mode</h2>"
+        "<label class='switch'>"
+        "<input type='checkbox' id='modeToggle' %s>"  // Checkbox checked if AUTO
+        "<span class='slider'></span>"
+        "</label>"
+        "<p><strong>Current Mode:</strong> <span id='modeLabel'>%s</span></p>"
+
+        "<script>"  // JavaScript to handle toggle switch event
+        "document.getElementById('modeToggle').addEventListener('change', function() {"
+        "  if(this.checked) {"
+        "    fetch('/mode/auto');"
+        "    document.getElementById('modeLabel').innerText = 'AUTO';"
+        "  } else {"
+        "    fetch('/mode/manual');"
+        "    document.getElementById('modeLabel').innerText = 'MANUAL';"
+        "  }"
+        "});"
+        "</script>",
+        mode_flag ? "checked" : "",  // Set 'checked' attribute if in AUTO
+        mode_flag ? "AUTO" : "MANUAL");
+
+        // 3. Status Overview Section
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'>"
+        "<h2>Status Overview</h2>"
+        "<p><strong>Solar Panel Power Percentage:</strong> %0.2f%%</p>"
+        "<p><strong>Servo Motor Direction:</strong> %s</p>"
+        "<p><strong>Environmental Condition:</strong> %s</p>"
+        "<p><strong>Panel Angle:</strong> %f°</p>"
+        "</div>", solarValue, flagStatus[flag], solarStatus[flagSolar], anglePanel);
+
+        // 4. AUTO Mode Info Block (only shown in AUTO mode)
+        if (mode_flag == 1) {
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'>"
+        "<h2>Auto Mode Status</h2>"
+        "<p><strong>Motor Direction (by LDR):</strong> %s</p>"
+        "<p><strong>Heater Status:</strong> %s</p>"
+        "<p><strong>wiper Status:</strong> %s</p>"
+        "</div>", flagStatus[flag], led1_state, led2_state);
+        }
+
+        // 5. Manual Motor Control Buttons (only shown in MANUAL mode)
+        if (mode_flag == 0) {
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'>"
+        "<h2>Manual Motor Control</h2>"
+        "<p><strong>Motor Direction:</strong> %s</p>"
+        "<button onclick=\"fetch('/motor/cw')\">Rotate Clockwise</button>"
+        "<button onclick=\"fetch('/motor/ccw')\">Rotate Anti-Clockwise</button>"
+        "<button onclick=\"fetch('/motor/stop')\">Stop</button>"
+        "</div>",
+        (manual_motor_direction == 1 ? "CLOCKWISE" :
+        manual_motor_direction == 2 ? "ANTICLOCKWISE" : "STOPPED"));
+
+        // 6. LED Relay Controls (also only in MANUAL mode)
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "<div class='section'>"
+        "<h2>Relay Control</h2>"
+
+        "<div style='display: flex; gap: 40px;'>"
+
+        "<div>"
+        "<p><strong>Heater:</strong></p>"
+        "<label class='switch-led'>"
+        "<input type='checkbox' id='led1Toggle' %s>"
+        "<span class='slider-led'></span>"
+        "</label>"
+        "</div>"
+
+        "<div>"
+        "<p><strong>Wiper:</strong></p>"
+        "<label class='switch-led'>"
+        "<input type='checkbox' id='led2Toggle' %s>"
+        "<span class='slider-led'></span>"
+        "</label>"
+        "</div>"
+
+        "</div>"
+
+        "<script>"
+        "document.getElementById('led1Toggle').addEventListener('change', function() {"
+        "  fetch(this.checked ? '/led1/on' : '/led1/off');"
+        "});"
+        "document.getElementById('led2Toggle').addEventListener('change', function() {"
+        "  fetch(this.checked ? '/led2/on' : '/led2/off');"
+        "});"
+        "</script>"
+
+        "</div>",
+        (strcmp(led1_state, "ON") == 0 ? "checked" : ""),  // Pre-check if ON
+        (strcmp(led2_state, "ON") == 0 ? "checked" : ""));
+        }
+
+        // Close the HTML body and page
+        snprintf(webpage_data + strlen(webpage_data), sizeof(webpage_data) - strlen(webpage_data),
+        "</body></html>");
+
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ================= HTTP HANDLERS =================
+
+// Handler for serving the main webpage
+static esp_err_t http_get_handler(httpd_req_t *req) 
+{
+    httpd_resp_send(req, webpage_data, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to turn ON LED1 (Heater)
+static esp_err_t led1_on_handler(httpd_req_t *req) 
+{
+    gpio_set_level(LED1_PIN, 1);      // Set GPIO high
+    led1_state = "ON";                // Update state variable
+    httpd_resp_send(req, "LED1 ON", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to turn OFF LED1 (Heater)
+static esp_err_t led1_off_handler(httpd_req_t *req) 
+{
+    gpio_set_level(LED1_PIN, 0);      // Set GPIO low
+    led1_state = "OFF";               // Update state variable
+    httpd_resp_send(req, "LED1 OFF", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to turn ON LED2 (Wiper)
+static esp_err_t led2_on_handler(httpd_req_t *req) 
+{
+    gpio_set_level(LED2_PIN, 1);      // Set GPIO high
+    led2_state = "ON";                // Update state variable
+    httpd_resp_send(req, "LED2 ON", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to turn OFF LED2 (Wiper)
+static esp_err_t led2_off_handler(httpd_req_t *req) 
+{
+    gpio_set_level(LED2_PIN, 0);      // Set GPIO low
+    led2_state = "OFF";               // Update state variable
+    httpd_resp_send(req, "LED2 OFF", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to set mode to AUTO
+static esp_err_t mode_auto_handler(httpd_req_t *req) 
+{
+    mode_flag = 1;    // Set AUTO mode
+    httpd_resp_send(req, "Mode set to AUTO", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to set mode to MANUAL
+static esp_err_t mode_manual_handler(httpd_req_t *req) 
+{
+    mode_flag = 0;    // Set MANUAL mode
+    httpd_resp_send(req, "Mode set to MANUAL", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for manual motor clockwise command
+static esp_err_t motor_cw_handler(httpd_req_t *req) 
+{
+    if (mode_flag == 0) manual_motor_direction = 1;   // Only if in MANUAL
+    httpd_resp_send(req, "Motor CW", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for manual motor anticlockwise command
+static esp_err_t motor_ccw_handler(httpd_req_t *req) 
+{
+    if (mode_flag == 0) manual_motor_direction = 2;   // Only if in MANUAL
+    httpd_resp_send(req, "Motor CCW", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler to stop the motor
+static esp_err_t motor_stop_handler(httpd_req_t *req) 
+{
+    if (mode_flag == 0) manual_motor_direction = 0;   // Only if in MANUAL
+    httpd_resp_send(req, "Motor STOP", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+
+// ================= URI DEFINITIONS =================
+
+// URI for main page
+static httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = http_get_handler, .user_ctx = NULL };
+
+// URIs for LED1 control
+static httpd_uri_t uri_led1_on = { .uri = "/led1/on", .method = HTTP_GET, .handler = led1_on_handler, .user_ctx = NULL };
+static httpd_uri_t uri_led1_off = { .uri = "/led1/off", .method = HTTP_GET, .handler = led1_off_handler, .user_ctx = NULL };
+
+// URIs for LED2 control
+static httpd_uri_t uri_led2_on = { .uri = "/led2/on", .method = HTTP_GET, .handler = led2_on_handler, .user_ctx = NULL };
+static httpd_uri_t uri_led2_off = { .uri = "/led2/off", .method = HTTP_GET, .handler = led2_off_handler, .user_ctx = NULL };
+
+// URIs for AUTO/MANUAL mode toggle
+static httpd_uri_t uri_mode_auto = 
+{
+    .uri = "/mode/auto",
+    .method = HTTP_GET,
+    .handler = mode_auto_handler,
+    .user_ctx = NULL
+};
+
+static httpd_uri_t uri_mode_manual = 
+{
+    .uri = "/mode/manual",
+    .method = HTTP_GET,
+    .handler = mode_manual_handler,
+    .user_ctx = NULL
+};
+
+// URIs for motor control (MANUAL mode only)
+static httpd_uri_t uri_motor_cw = 
+{
+    .uri = "/motor/cw",
+    .method = HTTP_GET,
+    .handler = motor_cw_handler,
+    .user_ctx = NULL
+};
+
+static httpd_uri_t uri_motor_ccw = 
+{
+    .uri = "/motor/ccw",
+    .method = HTTP_GET,
+    .handler = motor_ccw_handler,
+    .user_ctx = NULL
+};
+
+static httpd_uri_t uri_motor_stop = 
+{
+    .uri = "/motor/stop",
+    .method = HTTP_GET,
+    .handler = motor_stop_handler,
+    .user_ctx = NULL
+};
+
+
+// ================= START WEBSERVER FUNCTION =================
+
+// Initializes and starts HTTP web server with all routes registered
+static httpd_handle_t start_webserver(void) 
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;  // Increase limit to handle more endpoints
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) 
+    {
+        httpd_register_uri_handler(server, &uri_get);
+        httpd_register_uri_handler(server, &uri_led1_on);
+        httpd_register_uri_handler(server, &uri_led1_off);
+        httpd_register_uri_handler(server, &uri_led2_on);
+        httpd_register_uri_handler(server, &uri_led2_off);
+        httpd_register_uri_handler(server, &uri_mode_auto);
+        httpd_register_uri_handler(server, &uri_mode_manual);
+        httpd_register_uri_handler(server, &uri_motor_cw);
+        httpd_register_uri_handler(server, &uri_motor_ccw);
+        httpd_register_uri_handler(server, &uri_motor_stop);
+    }
+
+    return server;
+}
+
+
+// ================= WIFI SOFTAP INITIALIZATION =================
+
+// Configures ESP32 to act as a Wi-Fi Access Point
+static void wifi_init_softap(void) 
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();    // Create default Wi-Fi AP interface
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = 
+    {
+        .ap = 
+        {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_AP);                           // Set mode to Access Point
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);             // Set credentials
+    esp_wifi_start();                                          // Start Wi-Fi
+}
+
+
+// ================= APPLICATION ENTRY POINT =================
+
+// Main application function called on boot
+void app_main() 
+{
+    nvs_flash_init();                  // Initialize non-volatile storage
+    wifi_init_softap();                // Start Wi-Fi in SoftAP mode
+
+    gpio_reset_pin(LED1_PIN);          // Reset and configure LED1 GPIO
+    gpio_set_direction(LED1_PIN, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(LED2_PIN);          // Reset and configure LED2 GPIO
+    gpio_set_direction(LED2_PIN, GPIO_MODE_OUTPUT);
+
+    configure_pwm();                   // Initialize PWM for servo motor
+    start_webserver();                 // Start HTTP server and register URI handlers
+    xTaskCreate(pwm_control_task, "pwm_control_task", 4096, NULL, 5, NULL);  // Start main task
+}
